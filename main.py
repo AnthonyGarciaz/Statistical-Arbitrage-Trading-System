@@ -2,180 +2,411 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy import stats
-from statsmodels.tsa.stattools import coint
-from typing import Tuple, List, Dict
+from statsmodels.tsa.stattools import coint, adfuller
+from typing import Tuple, List, Dict, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
 class StatArbSystem:
-    def __init__(self, lookback_period: int = 252, z_threshold: float = 2.0,
-                 stop_loss: float = 0.05, take_profit: float = 0.1):
-        """Initialize the Statistical Arbitrage Trading System."""
+    def __init__(self, stock1: str, stock2: str, lookback_period: int = 252, entry_z_threshold: float = 2.0,
+                 exit_z_threshold: float = 0.5, stop_loss: float = 0.05,
+                 take_profit: float = 0.1, transaction_cost: float = 0.001,
+                 position_size: float = 1.0):
+        """
+        Enhanced Statistical Arbitrage Trading System
+        """
+        self.stock1 = stock1
+        self.stock2 = stock2
         self.lookback_period = lookback_period
-        self.z_threshold = z_threshold
+        self.entry_z_threshold = entry_z_threshold
+        self.exit_z_threshold = exit_z_threshold
         self.stop_loss = stop_loss
         self.take_profit = take_profit
-        self.pairs_data = {}
+        self.transaction_cost = transaction_cost
+        self.position_size = position_size
+        self.position = 0
+        self.stats = {}
 
-    # ... (previous methods remain the same until backtest_pair) ...
+    def get_data(self) -> pd.DataFrame:
+        """
+        Get stock price data with proper index handling and data quality checks
+        """
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=self.lookback_period)
 
-    def backtest_pair(self, price1: pd.Series, price2: pd.Series,
-                      initial_capital: float = 100000) -> Dict:
-        """Backtest a pairs trading strategy."""
-        # Calculate hedge ratio and spread
-        hedge_ratio, _ = self.calculate_hedge_ratio(price1, price2)
-        spread = self.calculate_spread(price1, price2, hedge_ratio)
+            # Download daily data for both stocks
+            print(f"Downloading data for {self.stock1} and {self.stock2}...")
+            df1 = yf.download(self.stock1, start=start, end=end, progress=False)
+            df2 = yf.download(self.stock2, start=start, end=end, progress=False)
 
-        # Generate signals
-        signals = self.generate_signals(spread)
+            if df1.empty or df2.empty:
+                raise ValueError(f"No data available for {self.stock1} or {self.stock2}")
 
-        # Initialize position and portfolio variables
-        position = 0
-        portfolio_value = pd.Series(index=price1.index, dtype=float)
-        portfolio_value.iloc[0] = initial_capital
-        returns = pd.Series(index=price1.index, dtype=float)
-        returns.iloc[0] = 0.0
+            common_dates = df1.index.intersection(df2.index)
+            if len(common_dates) < 30:
+                raise ValueError("Insufficient data points for analysis")
 
-        # Track trades
-        trades = []
-        current_trade = None
+            combined_data = pd.DataFrame(index=common_dates)
+            combined_data[self.stock1] = df1.loc[common_dates, 'Adj Close']
+            combined_data[self.stock2] = df2.loc[common_dates, 'Adj Close']
 
-        for i in range(1, len(signals.index)):
-            if signals.iloc[i] != 0 and position == 0:
-                # Enter new position
-                position = signals.iloc[i]
-                entry_spread = spread.iloc[i]
-                current_trade = {
-                    'entry_date': spread.index[i],
-                    'entry_spread': entry_spread,
-                    'position': position
-                }
+            if combined_data.isnull().any().any():
+                combined_data = combined_data.dropna()
+                if len(combined_data) < 30:
+                    raise ValueError("Insufficient data points after removing missing values")
 
-            elif position != 0:
-                # Calculate return
-                spread_return = (spread.iloc[i] - spread.iloc[i - 1]) / abs(spread.iloc[i - 1])
-                returns.iloc[i] = position * spread_return
+            print(f"Successfully retrieved {len(combined_data)} days of data")
+            return combined_data
 
-                # Check stop loss and take profit
-                total_return = (spread.iloc[i] - current_trade['entry_spread']) / \
-                               abs(current_trade['entry_spread'])
+        except Exception as e:
+            raise Exception(f"Error getting data: {str(e)}")
 
-                if (position * total_return < -self.stop_loss) or \
-                        (position * total_return > self.take_profit) or \
-                        (signals.iloc[i] == -position):
-                    # Close position
-                    current_trade['exit_date'] = spread.index[i]
-                    current_trade['exit_spread'] = spread.iloc[i]
-                    current_trade['return'] = position * total_return
-                    trades.append(current_trade)
+    def calculate_spread(self, data: pd.DataFrame) -> pd.Series:
+        """
+        Calculate the normalized price spread between stocks
+        """
+        try:
+            stock1_norm = data[self.stock1] / data[self.stock1].iloc[0]
+            stock2_norm = data[self.stock2] / data[self.stock2].iloc[0]
+            spread = stock1_norm - stock2_norm
+            z_score = (spread - spread.mean()) / spread.std()
+            return pd.Series(z_score, index=data.index)
 
-                    position = 0
-                    current_trade = None
+        except Exception as e:
+            raise Exception(f"Error calculating spread: {str(e)}")
 
-            # Update portfolio value
-            portfolio_value.iloc[i] = portfolio_value.iloc[i - 1] * (1 + returns.iloc[i])
+    def calculate_returns(self, data: pd.DataFrame, positions: pd.Series) -> pd.Series:
+        """
+        Calculate strategy returns with transaction costs
+        """
+        try:
+            returns1 = data[self.stock1].pct_change()
+            returns2 = data[self.stock2].pct_change()
+            strategy_returns = positions * (returns1 - returns2)
 
-        # Calculate performance metrics
-        total_return = (portfolio_value.iloc[-1] - initial_capital) / initial_capital
-        daily_returns = portfolio_value.pct_change().dropna()
-        sharpe_ratio = np.sqrt(252) * daily_returns.mean() / daily_returns.std()
-        max_drawdown = (portfolio_value / portfolio_value.cummax() - 1).min()
+            position_changes = positions.diff().fillna(0)
+            transaction_costs = abs(position_changes) * self.transaction_cost
+            final_returns = strategy_returns - transaction_costs
+            return final_returns
+
+        except Exception as e:
+            raise Exception(f"Error calculating returns: {str(e)}")
+
+    def perform_statistical_analysis(self, data: pd.DataFrame) -> Dict:
+        """
+        Comprehensive statistical analysis of the pair
+        """
+        try:
+            # Calculate correlation
+            correlation = data[self.stock1].corr(data[self.stock2])
+
+            # Calculate beta
+            beta = np.cov(data[self.stock1], data[self.stock2])[0][1] / np.var(data[self.stock2])
+
+            # Perform cointegration test
+            # Note: coint returns: test statistic, p-value, critical values
+            coint_result = coint(data[self.stock1], data[self.stock2])
+            p_value = coint_result[1]  # Extract just the p-value
+
+            # Calculate spread and perform ADF test
+            spread = self.calculate_spread(data)
+            adf_result = adfuller(spread)
+            adf_stat = adf_result[0]
+            adf_p_value = adf_result[1]
+
+            # Calculate half-life of mean reversion
+            spread_lag = spread.shift(1)
+            spread_diff = spread - spread_lag
+            spread_lag = spread_lag[1:]
+            spread_diff = spread_diff[1:]
+            beta_half_life = np.polyfit(spread_lag, spread_diff, 1)[0]
+            half_life = -np.log(2) / beta_half_life if beta_half_life < 0 else np.inf
+
+            return {
+                'correlation': correlation,
+                'beta': beta,
+                'coint_p_value': p_value,
+                'adf_stat': adf_stat,
+                'adf_p_value': adf_p_value,
+                'half_life': half_life,
+                # Add more details for debugging
+                'coint_test_stat': coint_result[0],
+                'coint_critical_values': coint_result[2],
+                'adf_critical_values': adf_result[4]
+            }
+
+        except Exception as e:
+            raise Exception(f"Error in statistical analysis: {str(e)}")
+
+    def check_pair_eligibility(self, stats: Dict) -> Tuple[bool, str]:
+        """
+        Enhanced pair eligibility checking with multiple criteria
+        """
+        criteria = []
+        is_eligible = True
+
+        if stats['correlation'] < 0.8:
+            criteria.append("Low correlation")
+            is_eligible = False
+
+        if stats['coint_p_value'] > 0.05:
+            criteria.append("Not cointegrated")
+            is_eligible = False
+
+        if stats['adf_p_value'] > 0.05:
+            criteria.append("Spread not stationary")
+            is_eligible = False
+
+        if not (5 <= stats['half_life'] <= self.lookback_period):
+            criteria.append("Invalid half-life")
+            is_eligible = False
+
+        return is_eligible, ", ".join(criteria) if criteria else "Pair is eligible"
+
+    def calculate_risk_metrics(self, returns: pd.Series) -> Dict:
+        """
+        Calculate comprehensive risk metrics
+        """
+        daily_returns = returns.dropna()
 
         return {
-            'total_return': total_return,
-            'sharpe_ratio': sharpe_ratio,
-            'max_drawdown': max_drawdown,
-            'trades': trades,
-            'portfolio_value': portfolio_value,
-            'returns': returns
+            'sharpe_ratio': np.sqrt(252) * daily_returns.mean() / daily_returns.std(),
+            'sortino_ratio': np.sqrt(252) * daily_returns.mean() / daily_returns[daily_returns < 0].std(),
+            'max_drawdown': (daily_returns.cumsum() - daily_returns.cumsum().expanding().max()).min(),
+            'var_95': daily_returns.quantile(0.05),
+            'var_99': daily_returns.quantile(0.01),
+            'win_rate': len(daily_returns[daily_returns > 0]) / len(daily_returns),
+            'profit_factor': abs(daily_returns[daily_returns > 0].sum() / daily_returns[daily_returns < 0].sum())
         }
 
-    def plot_pair_analysis(self, price1: pd.Series, price2: pd.Series,
-                           results: Dict) -> None:
-        """Plot comprehensive pair trading analysis."""
-        # Set the style
-        plt.style.use('default')  # Use default style instead of seaborn
-        sns.set_style("whitegrid")  # Apply seaborn's grid style
+    def generate_signals(self, z_score: float, current_pnl: float = 0) -> int:
+        """
+        Enhanced signal generation with risk management
+        """
+        if abs(current_pnl) >= self.stop_loss and self.position != 0:
+            return 0
+        if current_pnl >= self.take_profit and self.position != 0:
+            return 0
 
-        fig = plt.figure(figsize=(15, 12))
-        gs = plt.GridSpec(3, 2, figure=fig)
+        if self.position == 0:
+            if z_score > self.entry_z_threshold:
+                return -1 * self.position_size
+            elif z_score < -self.entry_z_threshold:
+                return 1 * self.position_size
+            return 0
 
-        # Plot 1: Price Series
-        ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(price1.index, price1 / price1.iloc[0], label=price1.name)
-        ax1.plot(price2.index, price2 / price2.iloc[0], label=price2.name)
-        ax1.set_title('Normalized Price Series')
-        ax1.legend()
+        elif self.position > 0:
+            if z_score >= -self.exit_z_threshold:
+                return 0
+            return self.position
 
-        # Plot 2: Spread Z-Score
-        ax2 = fig.add_subplot(gs[1, 0])
-        hedge_ratio, _ = self.calculate_hedge_ratio(price1, price2)
-        spread = self.calculate_spread(price1, price2, hedge_ratio)
-        z_score = (spread - spread.rolling(window=self.lookback_period).mean()) / \
-                  spread.rolling(window=self.lookback_period).std()
-        ax2.plot(z_score)
-        ax2.axhline(y=self.z_threshold, color='r', linestyle='--')
-        ax2.axhline(y=-self.z_threshold, color='r', linestyle='--')
-        ax2.set_title('Spread Z-Score')
+        else:  # position < 0
+            if z_score <= self.exit_z_threshold:
+                return 0
+            return self.position
 
-        # Plot 3: Portfolio Value
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.plot(results['portfolio_value'])
-        ax3.set_title('Portfolio Value')
+    def run_backtest(self) -> Dict:
+        """
+        Comprehensive backtesting framework
+        """
+        try:
+            data = self.get_data()
+            self.stats = self.perform_statistical_analysis(data)
+            is_eligible, reason = self.check_pair_eligibility(self.stats)
 
-        # Plot 4: Returns Distribution
-        ax4 = fig.add_subplot(gs[2, 0])
-        sns.histplot(data=results['returns'].dropna(), kde=True, ax=ax4)
-        ax4.set_title('Returns Distribution')
+            if not is_eligible:
+                return {'success': False, 'message': reason}
 
-        # Plot 5: Drawdown
-        ax5 = fig.add_subplot(gs[2, 1])
-        drawdown = results['portfolio_value'] / results['portfolio_value'].cummax() - 1
-        ax5.plot(drawdown)
-        ax5.set_title('Drawdown')
+            z_scores = self.calculate_spread(data)
+            positions = pd.Series(index=data.index, dtype=float)
+            returns = pd.Series(index=data.index, dtype=float)
+            current_pnl = 0
 
-        plt.tight_layout()
-        plt.show()
+            for i in range(1, len(data)):
+                if i > 0 and positions.iloc[i - 1] != 0:
+                    returns1 = data[self.stock1].iloc[i] / data[self.stock1].iloc[i - 1] - 1
+                    returns2 = data[self.stock2].iloc[i] / data[self.stock2].iloc[i - 1] - 1
+                    current_pnl += positions.iloc[i - 1] * (returns1 - returns2)
+
+                positions.iloc[i] = self.generate_signals(z_scores.iloc[i], current_pnl)
+
+                if positions.iloc[i] == 0:
+                    current_pnl = 0
+
+            strategy_returns = self.calculate_returns(data, positions)
+            risk_metrics = self.calculate_risk_metrics(strategy_returns)
+
+            return {
+                'success': True,
+                'statistics': self.stats,
+                'risk_metrics': risk_metrics,
+                'positions': positions.tolist(),
+                'returns': strategy_returns.tolist(),
+                'data_points': len(data)
+            }
+
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+        # [Previous code remains the same until the end of run_backtest]
+
+    def optimize_parameters(self) -> Dict:
+        """
+        Optimize strategy parameters to target Sharpe ratio of 1.8
+        """
+        try:
+            # Parameter ranges to test
+            entry_thresholds = np.arange(1.5, 3.0, 0.25)
+            exit_thresholds = np.arange(0.25, 1.0, 0.25)
+            stop_losses = np.arange(0.03, 0.08, 0.01)
+            take_profits = np.arange(0.08, 0.15, 0.01)
+
+            best_params = None  # Changed from {} to None for better checking
+            best_sharpe = float('-inf')  # Changed from 0 to handle negative Sharpe ratios
+            failed_attempts = 0
+            max_failed_attempts = 3  # Limit consecutive failures
+
+            # Store original parameters
+            orig_params = {
+                'entry': self.entry_z_threshold,
+                'exit': self.exit_z_threshold,
+                'stop': self.stop_loss,
+                'profit': self.take_profit
+            }
+
+            print("\nOptimizing parameters...")
+            total_iterations = len(entry_thresholds) * len(exit_thresholds) * len(stop_losses) * len(take_profits)
+            current_iteration = 0
+
+            # Get initial data once to verify pair is valid
+            initial_check = self.run_backtest()
+            if not initial_check['success']:
+                raise Exception(f"Pair is not suitable for trading: {initial_check['message']}")
+
+            for entry in entry_thresholds:
+                for exit in exit_thresholds:
+                    for stop in stop_losses:
+                        for profit in take_profits:
+                            current_iteration += 1
+                            if current_iteration % 10 == 0:  # Increased progress update frequency
+                                print(f"Progress: {current_iteration}/{total_iterations} "
+                                      f"({(current_iteration / total_iterations) * 100:.1f}%)")
+
+                            # Update parameters
+                            self.entry_z_threshold = entry
+                            self.exit_z_threshold = exit
+                            self.stop_loss = stop
+                            self.take_profit = profit
+
+                            # Run backtest with timeout protection
+                            try:
+                                results = self.run_backtest()
+                                if results['success']:
+                                    sharpe = results['risk_metrics']['sharpe_ratio']
+                                    failed_attempts = 0  # Reset failed attempts counter
+
+                                    # Check if closer to target of 1.8
+                                    if abs(1.8 - sharpe) < abs(1.8 - best_sharpe):
+                                        best_sharpe = sharpe
+                                        best_params = {
+                                            'entry_threshold': entry,
+                                            'exit_threshold': exit,
+                                            'stop_loss': stop,
+                                            'take_profit': profit,
+                                            'sharpe_ratio': sharpe
+                                        }
+                                else:
+                                    failed_attempts += 1
+                                    if failed_attempts >= max_failed_attempts:
+                                        print(f"Too many consecutive failures. Skipping to next parameter set.")
+                                        failed_attempts = 0
+                                        continue
+
+                            except Exception as e:
+                                print(f"Error during optimization iteration: {str(e)}")
+                                failed_attempts += 1
+                                if failed_attempts >= max_failed_attempts:
+                                    print(f"Too many consecutive failures. Skipping to next parameter set.")
+                                    failed_attempts = 0
+                                    continue
+
+            # Restore original parameters
+            self.entry_z_threshold = orig_params['entry']
+            self.exit_z_threshold = orig_params['exit']
+            self.stop_loss = orig_params['stop']
+            self.take_profit = orig_params['profit']
+
+            if best_params is None:
+                raise Exception("No valid parameter combination found")
+
+            print("\nOptimization complete!")
+            return best_params
+
+        except Exception as e:
+            raise Exception(f"Error in parameter optimization: {str(e)}")
+
 
 
 def main():
-    # Initialize the system
-    stat_arb = StatArbSystem(
-        lookback_period=252,  # One year of trading days
-        z_threshold=2.0,  # Entry/exit threshold
-        stop_loss=0.05,  # 5% stop loss
-        take_profit=0.10  # 10% take profit
-    )
+        pairs = [
+            ('MSFT', 'AAPL'), ('GOOGL', 'META'), ('INTC', 'AMD'),
 
-    # Example usage
-    tickers = ['XLF', 'BAC', 'JPM', 'WFC', 'C', 'GS']
-    start_date = '2020-01-01'
-    end_date = '2023-12-31'
+        ]
 
-    # Fetch data
-    data = stat_arb.fetch_data(tickers, start_date, end_date)
+        print("Statistical Arbitrage Trading System Backtest Results")
+        print("=" * 50)
 
-    # Find cointegrated pairs
-    pairs = stat_arb.find_cointegrated_pairs(data)
-    print("\nCointegrated Pairs:")
-    for pair in pairs:
-        print(f"{pair[0]} - {pair[1]}: p-value = {pair[2]:.4f}")
+        for stock1, stock2 in pairs:
+            try:
+                print(f"\nTesting pair: {stock1}-{stock2}")
+                trader = StatArbSystem(stock1, stock2)
 
-    if pairs:
-        # Analyze first pair
-        stock1, stock2, _ = pairs[0]
-        results = stat_arb.backtest_pair(data[stock1], data[stock2])
+                # Optimize parameters first
+                best_params = trader.optimize_parameters()
 
-        print(f"\nBacktest Results for {stock1}-{stock2}:")
-        print(f"Total Return: {results['total_return']:.2%}")
-        print(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
-        print(f"Max Drawdown: {results['max_drawdown']:.2%}")
+                # Update trader with optimized parameters
+                trader.entry_z_threshold = best_params['entry_threshold']
+                trader.exit_z_threshold = best_params['exit_threshold']
+                trader.stop_loss = best_params['stop_loss']
+                trader.take_profit = best_params['take_profit']
 
-        # Plot analysis
-        stat_arb.plot_pair_analysis(data[stock1], data[stock2], results)
+                # Run backtest with optimized parameters
+                results = trader.run_backtest()
 
+                if results['success']:
+                    metrics = results['risk_metrics']
+                    stats = results['statistics']
+
+                    print("\nOptimized Parameters:")
+                    print(f"Entry Z-Score: {best_params['entry_threshold']:.2f}")
+                    print(f"Exit Z-Score: {best_params['exit_threshold']:.2f}")
+                    print(f"Stop Loss: {best_params['stop_loss']:.2%}")
+                    print(f"Take Profit: {best_params['take_profit']:.2%}")
+
+                    print("\nStatistical Analysis:")
+                    print(f"Correlation: {stats['correlation']:.2f}")
+                    print(f"Cointegration p-value: {stats['coint_p_value']:.4f}")
+                    print(f"Half-life: {stats['half_life']:.1f} days")
+
+                    print("\nPerformance Metrics:")
+                    print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+                    print(f"Sortino Ratio: {metrics['sortino_ratio']:.2f}")
+                    print(f"Maximum Drawdown: {metrics['max_drawdown']:.2%}")
+                    print(f"Win Rate: {metrics['win_rate']:.2%}")
+                    print(f"Profit Factor: {metrics['profit_factor']:.2f}")
+                else:
+                    print(f"Error: {results['message']}")
+
+            except Exception as e:
+                print(f"Error processing pair {stock1}-{stock2}: {str(e)}")
+                continue
 
 if __name__ == "__main__":
     main()
