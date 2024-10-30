@@ -4,9 +4,6 @@ import yfinance as yf
 from scipy import stats
 from statsmodels.tsa.stattools import coint, adfuller
 from typing import Tuple, List, Dict, Optional
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.preprocessing import StandardScaler
 from datetime import datetime, timedelta
 import warnings
 
@@ -35,14 +32,14 @@ class StatArbSystem:
 
     def get_data(self) -> pd.DataFrame:
         """
-        Get stock price data with proper index handling and data quality checks
+        Fetch stock price data with proper index handling and data quality checks.
         """
         try:
             end = datetime.now()
             start = end - timedelta(days=self.lookback_period)
 
             # Download daily data for both stocks
-            print(f"Downloading data for {self.stock1} and {self.stock2}...")
+            #print(f"Downloading data for {self.stock1} and {self.stock2}...")
             df1 = yf.download(self.stock1, start=start, end=end, progress=False)
             df2 = yf.download(self.stock2, start=start, end=end, progress=False)
 
@@ -57,12 +54,11 @@ class StatArbSystem:
             combined_data[self.stock1] = df1.loc[common_dates, 'Adj Close']
             combined_data[self.stock2] = df2.loc[common_dates, 'Adj Close']
 
-            if combined_data.isnull().any().any():
-                combined_data = combined_data.dropna()
-                if len(combined_data) < 30:
-                    raise ValueError("Insufficient data points after removing missing values")
+            combined_data = combined_data.dropna()
+            if len(combined_data) < 30:
+                raise ValueError("Insufficient data points after removing missing values")
 
-            print(f"Successfully retrieved {len(combined_data)} days of data")
+            ##print(f"Successfully retrieved {len(combined_data)} days of data")
             return combined_data
 
         except Exception as e:
@@ -70,7 +66,7 @@ class StatArbSystem:
 
     def calculate_spread(self, data: pd.DataFrame) -> pd.Series:
         """
-        Calculate the normalized price spread between stocks
+        Calculate the normalized price spread between stocks.
         """
         try:
             stock1_norm = data[self.stock1] / data[self.stock1].iloc[0]
@@ -212,9 +208,9 @@ class StatArbSystem:
                 return 0
             return self.position
 
-    def run_backtest(self) -> Dict:
+    def run_backtest(self, initial_investment: float = 1000) -> Dict:
         """
-        Comprehensive backtesting framework
+        Comprehensive backtesting framework with profit calculation based on initial investment.
         """
         try:
             data = self.get_data()
@@ -243,23 +239,29 @@ class StatArbSystem:
             strategy_returns = self.calculate_returns(data, positions)
             risk_metrics = self.calculate_risk_metrics(strategy_returns)
 
+            # Calculate the total profit based on the initial investment
+            total_return = strategy_returns.sum()
+            final_value = initial_investment * (1 + total_return)
+            profit = final_value - initial_investment
+
             return {
                 'success': True,
                 'statistics': self.stats,
                 'risk_metrics': risk_metrics,
                 'positions': positions.tolist(),
                 'returns': strategy_returns.tolist(),
-                'data_points': len(data)
+                'data_points': len(data),
+                'initial_investment': initial_investment,
+                'final_value': final_value,
+                'profit': profit
             }
 
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
-        # [Previous code remains the same until the end of run_backtest]
-
     def optimize_parameters(self) -> Dict:
         """
-        Optimize strategy parameters to target Sharpe ratio of 1.8
+        Optimize strategy parameters to target Sharpe ratio close to 1.8
         """
         try:
             # Parameter ranges to test
@@ -268,12 +270,11 @@ class StatArbSystem:
             stop_losses = np.arange(0.03, 0.08, 0.01)
             take_profits = np.arange(0.08, 0.15, 0.01)
 
-            best_params = None  # Changed from {} to None for better checking
-            best_sharpe = float('-inf')  # Changed from 0 to handle negative Sharpe ratios
+            best_params = None
+            best_sharpe = float('-inf')
             failed_attempts = 0
-            max_failed_attempts = 3  # Limit consecutive failures
+            max_failed_attempts = 3
 
-            # Store original parameters
             orig_params = {
                 'entry': self.entry_z_threshold,
                 'exit': self.exit_z_threshold,
@@ -282,10 +283,11 @@ class StatArbSystem:
             }
 
             print("\nOptimizing parameters...")
-            total_iterations = len(entry_thresholds) * len(exit_thresholds) * len(stop_losses) * len(take_profits)
+
+            total_iterations = (len(entry_thresholds) * len(exit_thresholds) *
+                                len(stop_losses) * len(take_profits))
             current_iteration = 0
 
-            # Get initial data once to verify pair is valid
             initial_check = self.run_backtest()
             if not initial_check['success']:
                 raise Exception(f"Pair is not suitable for trading: {initial_check['message']}")
@@ -295,24 +297,21 @@ class StatArbSystem:
                     for stop in stop_losses:
                         for profit in take_profits:
                             current_iteration += 1
-                            if current_iteration % 10 == 0:  # Increased progress update frequency
+                            if current_iteration % 10 == 0:
                                 print(f"Progress: {current_iteration}/{total_iterations} "
                                       f"({(current_iteration / total_iterations) * 100:.1f}%)")
 
-                            # Update parameters
                             self.entry_z_threshold = entry
                             self.exit_z_threshold = exit
                             self.stop_loss = stop
                             self.take_profit = profit
 
-                            # Run backtest with timeout protection
                             try:
                                 results = self.run_backtest()
                                 if results['success']:
                                     sharpe = results['risk_metrics']['sharpe_ratio']
-                                    failed_attempts = 0  # Reset failed attempts counter
+                                    failed_attempts = 0
 
-                                    # Check if closer to target of 1.8
                                     if abs(1.8 - sharpe) < abs(1.8 - best_sharpe):
                                         best_sharpe = sharpe
                                         best_params = {
@@ -337,7 +336,6 @@ class StatArbSystem:
                                     failed_attempts = 0
                                     continue
 
-            # Restore original parameters
             self.entry_z_threshold = orig_params['entry']
             self.exit_z_threshold = orig_params['exit']
             self.stop_loss = orig_params['stop']
@@ -353,60 +351,70 @@ class StatArbSystem:
             raise Exception(f"Error in parameter optimization: {str(e)}")
 
 
-
 def main():
-        pairs = [
-            ('MSFT', 'AAPL'), ('GOOGL', 'META'), ('INTC', 'AMD'),
+    pairs = [
+         ('DUK', 'AEP'), ('CAT', 'DE'), ('UPS', 'FDX')
+,
+    ]
 
-        ]
+    print("\n📊 Statistical Arbitrage Trading System - Backtest Summary")
+    print("=" * 60)
 
-        print("Statistical Arbitrage Trading System Backtest Results")
-        print("=" * 50)
+    for stock1, stock2 in pairs:
+        try:
+            print(f"\n🔍 Testing Pair: {stock1} - {stock2}")
+            trader = StatArbSystem(stock1, stock2)
 
-        for stock1, stock2 in pairs:
-            try:
-                print(f"\nTesting pair: {stock1}-{stock2}")
-                trader = StatArbSystem(stock1, stock2)
+            print("\n⏳ Optimizing parameters, please wait...")
+            best_params = trader.optimize_parameters()
 
-                # Optimize parameters first
-                best_params = trader.optimize_parameters()
+            # Apply optimized parameters
+            trader.entry_z_threshold = best_params['entry_threshold']
+            trader.exit_z_threshold = best_params['exit_threshold']
+            trader.stop_loss = best_params['stop_loss']
+            trader.take_profit = best_params['take_profit']
 
-                # Update trader with optimized parameters
-                trader.entry_z_threshold = best_params['entry_threshold']
-                trader.exit_z_threshold = best_params['exit_threshold']
-                trader.stop_loss = best_params['stop_loss']
-                trader.take_profit = best_params['take_profit']
+            # Run backtest with optimized parameters
+            print("\n📈 Running backtest...")
+            results = trader.run_backtest()
 
-                # Run backtest with optimized parameters
-                results = trader.run_backtest()
+            if results['success']:
+                metrics = results['risk_metrics']
+                stats = results['statistics']
 
-                if results['success']:
-                    metrics = results['risk_metrics']
-                    stats = results['statistics']
+                print("\n🎯 Optimization Complete! Best Parameters Found:")
+                print(f"  • Entry Z-Score: {best_params['entry_threshold']:.2f}")
+                print(f"  • Exit Z-Score: {best_params['exit_threshold']:.2f}")
+                print(f"  • Stop Loss: {best_params['stop_loss']:.2%}")
+                print(f"  • Take Profit: {best_params['take_profit']:.2%}")
 
-                    print("\nOptimized Parameters:")
-                    print(f"Entry Z-Score: {best_params['entry_threshold']:.2f}")
-                    print(f"Exit Z-Score: {best_params['exit_threshold']:.2f}")
-                    print(f"Stop Loss: {best_params['stop_loss']:.2%}")
-                    print(f"Take Profit: {best_params['take_profit']:.2%}")
+                print("\n📊 Statistical Analysis for Pair:")
+                print(f"  • Correlation: {stats['correlation']:.2f}")
+                print(f"  • Cointegration p-value: {stats['coint_p_value']:.4f}")
+                print(f"  • Half-life: {stats['half_life']:.1f} days")
 
-                    print("\nStatistical Analysis:")
-                    print(f"Correlation: {stats['correlation']:.2f}")
-                    print(f"Cointegration p-value: {stats['coint_p_value']:.4f}")
-                    print(f"Half-life: {stats['half_life']:.1f} days")
+                print("\n💹 Performance Metrics:")
+                print(f"  • Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+                print(f"  • Sortino Ratio: {metrics['sortino_ratio']:.2f}")
+                print(f"  • Maximum Drawdown: {metrics['max_drawdown']:.2%}")
+                print(f"  • Win Rate: {metrics['win_rate']:.2%}")
+                print(f"  • Profit Factor: {metrics['profit_factor']:.2f}")
 
-                    print("\nPerformance Metrics:")
-                    print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
-                    print(f"Sortino Ratio: {metrics['sortino_ratio']:.2f}")
-                    print(f"Maximum Drawdown: {metrics['max_drawdown']:.2%}")
-                    print(f"Win Rate: {metrics['win_rate']:.2%}")
-                    print(f"Profit Factor: {metrics['profit_factor']:.2f}")
-                else:
-                    print(f"Error: {results['message']}")
+                # Display initial investment, final value, and profit
+                print("\n💸 Investment Summary:")
+                print(f"  • Initial Investment: ${results['initial_investment']:.2f}")
+                print(f"  • Final Value: ${results['final_value']:.2f}")
+                print(f"  • Profit/Loss: ${results['profit']:.2f} ({results['profit'] / results['initial_investment']:.2%})")
 
-            except Exception as e:
-                print(f"Error processing pair {stock1}-{stock2}: {str(e)}")
-                continue
+            else:
+                print(f"\n⚠️  Error: {results['message']}")
+
+        except Exception as e:
+            print(f"❌ Error processing pair {stock1}-{stock2}: {str(e)}")
+            continue
+
+    print("\n✨ Backtesting Completed!")
+
 
 if __name__ == "__main__":
     main()
