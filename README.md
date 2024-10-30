@@ -1,4 +1,3 @@
-C:\Users\antho\AppData\Local\Programs\Python\Python313\python.exe C:\Users\antho\OneDrive\Documents\GitHub\Statistical-Arbitrage-Trading-System\main.py 
 
 📊 Statistical Arbitrage Trading System - Backtest Summary
 ============================================================
